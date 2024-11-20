@@ -1,15 +1,31 @@
-const { version } = require("os")
 
+let { Doc } = require("diamond-types-node")
 let braidify = require("braid-http").http_server
+let fs = require("fs")
 
-let braid_shelf = {
-    db_folder: './braid_shelf_db',
+let MISSING_PARENT_VERSION = 'missing parent version'
+
+let braid_text = {
+    verbose: false,
+    db_folder: './braid-text-db',
+    length_cache_size: 10,
     cache: {},
+    delete_cache: {}
 }
 
-braid_shelf.serve = async (req, res, options = {}) => {
-    if (!options.key) options.key = req.url.split('?')[0]
+let waiting_puts = 0
+let prev_put_p = null
 
+let max_encoded_key_size = 240
+
+braid_text.serve = async (req, res, options = {}) => {
+    options = {
+        key: req.url.split('?')[0], // Default key
+        put_cb: (key, val) => { },  // Default callback when a PUT changes a key
+        ...options                  // Override with all options passed in
+    }
+
+    // free CORS
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Access-Control-Allow-Methods", "*")
     res.setHeader("Access-Control-Allow-Headers", "*")
@@ -20,10 +36,23 @@ braid_shelf.serve = async (req, res, options = {}) => {
         res.end(x ?? '')
     }
 
-    let resource = await get_resource(options.key)
-    braidify(req, res)
+    let resource = null
+    try {
+        resource = await get_resource(options.key)
 
-    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'application/json')
+        braidify(req, res)
+    } catch (e) {
+        return my_end(400, "The server failed to process this request. The error generated was: " + e)
+    }
+
+    let peer = req.headers["peer"]
+
+    let merge_type = req.headers["merge-type"]
+    if (!merge_type) merge_type = 'simpleton'
+    if (merge_type !== 'simpleton' && merge_type !== 'dt') return my_end(400, `Unknown merge type: ${merge_type}`)
+
+    // set default content type of text/plain
+    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'text/plain')
 
     // no matter what the content type is,
     // we want to set the charset to utf-8
@@ -43,7 +72,7 @@ braid_shelf.serve = async (req, res, options = {}) => {
     if (req.method == "OPTIONS") return my_end(200)
 
     if (req.method == "DELETE") {
-        await braid_shelf.delete(resource)
+        await braid_text.delete(resource)
         return my_end(200)
     }
 
@@ -51,33 +80,45 @@ braid_shelf.serve = async (req, res, options = {}) => {
         if (!req.subscribe) {
             res.setHeader("Accept-Subscribe", "true")
 
-            let old_write = res.write
-            let stuff_to_write = null
-            res.write = x => stuff_to_write = x
-            res.sendUpdate({
-                version: [JSON.stringify(resource.shelf[1])],
-                body: JSON.stringify(resource.shelf[0])
-            })
-            res.write = old_write
+            let x = null
+            try {
+                x = await braid_text.get(resource, { version: req.version, parents: req.parents })
+            } catch (e) {
+                return my_end(400, "The server failed to get something. The error generated was: " + e)
+            }
+
+            res.setHeader("Version", x.version.map((x) => JSON.stringify(x)).join(", "))
+
+            const buffer = Buffer.from(x.body, "utf8")
+            res.setHeader("Repr-Digest", `sha-256=:${require('crypto').createHash('sha256').update(buffer).digest('base64')}:`)
+            res.setHeader("Content-Length", buffer.length)
 
             if (req.method === "HEAD") return my_end(200)
 
-            return my_end(200, stuff_to_write)
+            return my_end(200, buffer)
         } else {
             if (!res.hasHeader("editable")) res.setHeader("Editable", "true")
-            res.setHeader("Merge-Type", 'shelf')
+            res.setHeader("Merge-Type", merge_type)
             if (req.method == "HEAD") return my_end(200)
 
             let options = {
+                peer,
+                version: req.version,
+                parents: req.parents,
                 merge_type,
                 subscribe: x => res.sendVersion(x),
                 write: (x) => res.write(x)
             }
 
-            res.startSubscription({ onClose: () => {resource.clients.delete(options)} })
+            res.startSubscription({
+                onClose: () => {
+                    if (merge_type === "dt") resource.clients.delete(options)
+                    else resource.simpleton_clients.delete(options)
+                }
+            })
 
             try {
-                return await braid_shelf.get(resource, options)
+                return await braid_text.get(resource, options)
             } catch (e) {
                 return my_end(400, "The server failed to get something. The error generated was: " + e)
             }
@@ -85,40 +126,166 @@ braid_shelf.serve = async (req, res, options = {}) => {
     }
 
     if (req.method == "PUT" || req.method == "POST" || req.method == "PATCH") {
-        let update = await req.parseUpdate()
+        if (waiting_puts >= 100) {
+            console.log(`The server is busy.`)
+            return my_end(503, "The server is busy.")
+        }
 
-        await braid_text.put(resource, update)
+        waiting_puts++
+        if (braid_text.verbose) console.log(`waiting_puts(after++) = ${waiting_puts}`)
 
-        return my_end(200, '{"ok": true}')            
+        let my_prev_put_p = prev_put_p
+        let done_my_turn = null
+        prev_put_p = new Promise(
+            (done) =>
+            (done_my_turn = (statusCode, x) => {
+                waiting_puts--
+                if (braid_text.verbose) console.log(`waiting_puts(after--) = ${waiting_puts}`)
+                my_end(statusCode, x)
+                done()
+            })
+        )
+        let patches = null
+        let ee = null
+        try {
+            patches = await req.patches()
+            for (let p of patches) p.content = p.content_text
+        } catch (e) { ee = e }
+        await my_prev_put_p
+
+        try {
+            if (ee) throw ee
+
+            let body = null
+            if (patches[0]?.unit === 'everything') {
+                body = patches[0].content
+                patches = null
+            }
+
+            await braid_text.put(resource, { peer, version: req.version, parents: req.parents, patches, body, merge_type })
+            
+            res.setHeader("Version", resource.doc.getRemoteVersion().map((x) => x.join("-")).sort())
+
+            options.put_cb(options.key, resource.val)
+        } catch (e) {
+            console.log(`${req.method} ERROR: ${e.stack}`)
+            if (e.message?.startsWith(MISSING_PARENT_VERSION)) {
+                // we couldn't apply the version, because we're missing its parents,
+                // we want to send a 4XX error, so the client will resend this request later,
+                // hopefully after we've received the necessary parents.
+
+                // here are some 4XX error code options..
+                //
+                // - 425 Too Early
+                //     - pros: our message is too early
+                //     - cons: associated with some "Early-Data" http thing, which we're not using
+                // - 400 Bad Request
+                //     - pros: pretty generic
+                //     - cons: implies client shouldn't resend as-is
+                // - 409 Conflict
+                //     - pros: doesn't imply modifications needed
+                //     - cons: the message is not conflicting with anything
+                // - 412 Precondition Failed
+                //     - pros: kindof true.. the precondition of having another version has failed..
+                //     - cons: not strictly true, as this code is associated with http's If-Unmodified-Since stuff
+                // - 422 Unprocessable Content
+                //     - pros: it's true
+                //     - cons: implies client shouldn't resend as-is (at least, it says that here: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/422)
+                // - 428 Precondition Required
+                //     - pros: the name sounds right
+                //     - cons: typically implies that the request was missing an http conditional field like If-Match. that is to say, it implies that the request is missing a precondition, not that the server is missing a precondition
+                return done_my_turn(425, e.message)
+            } else {
+                return done_my_turn(400, "The server failed to apply this version. The error generated was: " + e)
+            }
+        }
+
+        return done_my_turn(200)
     }
 
     throw new Error("unknown")
 }
 
-braid_shelf.delete = async (key) => {
+braid_text.delete = async (key) => {
     let resource = (typeof key == 'string') ? await get_resource(key) : key
     await resource.delete_me()
 }
 
-braid_shelf.get = async (key, options) => {
+braid_text.get = async (key, options) => {
     if (!options) {
         // if it doesn't exist already, don't create it in this case
-        if (!braid_shelf.cache[key]) return
-        return (await get_resource(key)).shelf
+        if (!braid_text.cache[key]) return
+        return (await get_resource(key)).val
     }
+
+    if (options.version) validate_version_array(options.version)
+    if (options.parents) validate_version_array(options.parents)
 
     let resource = (typeof key == 'string') ? await get_resource(key) : key
 
     if (!options.subscribe) {
-        return resource.shelf
+        let doc = resource.doc
+        if (options.version || options.parents) doc = dt_get(doc, options.version || options.parents)
+
+        let ret = {
+            version: doc.getRemoteVersion().map((x) => x.join("-")).sort(),
+            body: doc.get()
+        }
+
+        if (options.version || options.parents) doc.free()
+
+        return ret
     } else {
-        {
+        if (options.merge_type != "dt") {
+            let version = resource.doc.getRemoteVersion().map((x) => x.join("-")).sort()
+            let x = { version }
+
+            if (!options.parents && !options.version) {
+                x.parents = []
+                x.body = resource.doc.get()
+                options.subscribe(x)
+            } else {
+                x.parents = options.version ? options.version : options.parents
+                options.my_last_seen_version = x.parents
+
+                // only send them a version from these parents if we have these parents (otherwise we'll assume these parents are more recent, probably versions they created but haven't sent us yet, and we'll send them appropriate rebased updates when they send us these versions)
+                let local_version = OpLog_remote_to_local(resource.doc, x.parents)
+                if (local_version) {
+                    x.patches = get_xf_patches(resource.doc, local_version)
+                    options.subscribe(x)
+                }
+            }
+
+            options.my_last_sent_version = x.version
+            resource.simpleton_clients.add(options)
+        } else {
             let updates = null
 
-            options.subscribe({
-                version: [JSON.stringify(resource.shelf[1])],
-                body: JSON.stringify(resource.shelf[0])
-            })
+            if (resource.need_defrag) {
+                if (braid_text.verbose) console.log(`doing defrag..`)
+                resource.need_defrag = false
+                resource.doc = defrag_dt(resource.doc)
+            }
+
+            if (!options.parents && !options.version) {
+                options.subscribe({
+                    version: [],
+                    parents: [],
+                    body: "",
+                })
+
+                updates = dt_get_patches(resource.doc)
+            } else {
+                // Then start the subscription from the parents in options
+                updates = dt_get_patches(resource.doc, options.parents || options.version)
+            }
+
+            for (let u of updates)
+                options.subscribe({
+                    version: [u.version],
+                    parents: u.parents,
+                    patches: [{ unit: u.unit, range: u.range, content: u.content }],
+                })
 
             // Output at least *some* data, or else chrome gets confused and
             // thinks the connection failed.  This isn't strictly necessary,
@@ -136,18 +303,290 @@ braid_text.forget = async (key, options) => {
 
     let resource = (typeof key == 'string') ? await get_resource(key) : key
 
-    resource.clients.delete(options)
+    if (options.merge_type != "dt")
+        resource.simpleton_clients.delete(options)
+    else resource.clients.delete(options)
 }
 
 braid_text.put = async (key, options) => {
-    let { version, body } = options
+    let { version, patches, body, peer } = options
+
+    // support for json patch puts..
+    if (patches?.length && patches.every(x => x.unit === 'json')) {
+        let resource = (typeof key == 'string') ? await get_resource(key) : key
+        
+        let x = JSON.parse(resource.doc.get())
+        for (let p of patches)
+            apply_patch(x, p.range, p.content === '' ? undefined : JSON.parse(p.content))
+
+        return await braid_text.put(key, {
+            body: JSON.stringify(x, null, 4)
+        })
+    }
+
+    if (version) validate_version_array(version)
+
+    // translate a single parent of "root" to the empty array (same meaning)
+    let options_parents = options.parents
+    if (options_parents?.length === 1 && options_parents[0] === 'root')
+        options_parents = []
+
+    if (options_parents) validate_version_array(options_parents)
+    if (body != null && patches) throw new Error(`cannot have a body and patches`)
+    if (body != null && (typeof body !== 'string')) throw new Error(`body must be a string`)
+    if (patches) validate_patches(patches)
 
     let resource = (typeof key == 'string') ? await get_resource(key) : key
 
-    let delta = shelf_merge(resource.shelf, [JSON.parse(body), JSON.parse(version[0])])
+    if (options_parents) {
+        // make sure we have all these parents
+        for (let p of options_parents) {
+            let P = decode_version(p)
+            if (P[1] > (resource.actor_seqs[P[0]] ?? -1)) throw new Error(`${MISSING_PARENT_VERSION}: ${p}`)
+        }
+    }
 
+    let parents = resource.doc.getRemoteVersion().map((x) => x.join("-")).sort()
+    let og_parents = options_parents || parents
+
+    function get_len() {
+        let d = dt_get(resource.doc, og_parents)
+        let len = d.len()
+        d.free()
+        return len
+    }
+
+    let max_pos = resource.length_cache.get('' + og_parents) ??
+        (v_eq(parents, og_parents) ? resource.doc.len() : get_len())
+    
+    if (body != null) {
+        patches = [{
+            unit: 'text',
+            range: `[0:${max_pos}]`,
+            content: body
+        }]
+    }
+
+    let og_patches = patches
+    patches = patches.map((p) => ({
+        ...p,
+        range: p.range.match(/\d+/g).map((x) => parseInt(x)),
+        content_codepoints: [...p.content],
+    })).sort((a, b) => a.range[0] - b.range[0])
+
+    // validate patch positions
+    let must_be_at_least = 0
+    for (let p of patches) {
+        if (p.range[0] < must_be_at_least || p.range[0] > max_pos) throw new Error(`invalid patch range position: ${p.range[0]}`)
+        if (p.range[1] < p.range[0] || p.range[1] > max_pos) throw new Error(`invalid patch range position: ${p.range[1]}`)
+        must_be_at_least = p.range[1]
+    }
+
+    let change_count = patches.reduce((a, b) => a + b.content_codepoints.length + (b.range[1] - b.range[0]), 0)
+
+    let og_v = version?.[0] || `${(is_valid_actor(peer) && peer) || Math.random().toString(36).slice(2, 7)}-${change_count - 1}`
+
+    // reduce the version sequence by the number of char-edits
+    let v = decode_version(og_v)
+
+    // validate version: make sure we haven't seen it already
+    if (v[1] <= (resource.actor_seqs[v[0]] ?? -1)) {
+
+        if (!options.validate_already_seen_versions) return
+
+        // if we have seen it already, make sure it's the same as before
+        let updates = dt_get_patches(resource.doc, og_parents)
+
+        let seen = {}
+        for (let u of updates) {
+            u.version = decode_version(u.version)
+
+            if (!u.content) {
+                // delete
+                let v = u.version
+                for (let i = 0; i < u.end - u.start; i++) {
+                    let ps = (i < u.end - u.start - 1) ? [`${v[0]}-${v[1] - i - 1}`] : u.parents
+                    seen[JSON.stringify([v[0], v[1] - i, ps, u.start + i])] = true
+                }
+            } else {
+                // insert
+                let v = u.version
+                let content = [...u.content]
+                for (let i = 0; i < content.length; i++) {
+                    let ps = (i > 0) ? [`${v[0]}-${v[1] - content.length + i}`] : u.parents
+                    seen[JSON.stringify([v[0], v[1] + 1 - content.length + i, ps, u.start + i, content[i]])] = true
+                }
+            }
+        }
+
+        v = `${v[0]}-${v[1] + 1 - change_count}`
+        let ps = og_parents
+        let offset = 0
+        for (let p of patches) {
+            // delete
+            for (let i = p.range[0]; i < p.range[1]; i++) {
+                let vv = decode_version(v)
+
+                if (!seen[JSON.stringify([vv[0], vv[1], ps, p.range[1] - 1 + offset])]) throw new Error('invalid update: different from previous update with same version')
+
+                offset--
+                ps = [v]
+                v = vv
+                v = `${v[0]}-${v[1] + 1}`
+            }
+            // insert
+            for (let i = 0; i < p.content_codepoints?.length ?? 0; i++) {
+                let vv = decode_version(v)
+                let c = p.content_codepoints[i]
+
+                if (!seen[JSON.stringify([vv[0], vv[1], ps, p.range[1] + offset, c])]) throw new Error('invalid update: different from previous update with same version')
+
+                offset++
+                ps = [v]
+                v = vv
+                v = `${v[0]}-${v[1] + 1}`
+            }
+        }
+
+        // we already have this version, so nothing left to do
+        return
+    }
+    resource.actor_seqs[v[0]] = v[1]
+
+    resource.length_cache.put(`${v[0]}-${v[1]}`, patches.reduce((a, b) =>
+        a + (b.content_codepoints.length ? b.content_codepoints.length : -(b.range[1] - b.range[0])),
+        max_pos))
+
+    v = `${v[0]}-${v[1] + 1 - change_count}`
+
+    let ps = og_parents
+
+    let v_before = resource.doc.getLocalVersion()
+
+    let bytes = []
+
+    let offset = 0
+    for (let p of patches) {
+        // delete
+        let del = p.range[1] - p.range[0]
+        if (del) {
+            bytes.push(dt_create_bytes(v, ps, p.range[0] + offset, del, null))
+            offset -= del
+            v = decode_version(v)
+            ps = [`${v[0]}-${v[1] + (del - 1)}`]
+            v = `${v[0]}-${v[1] + del}`
+        }
+        // insert
+        if (p.content?.length) {
+            bytes.push(dt_create_bytes(v, ps, p.range[1] + offset, 0, p.content))
+            offset += p.content_codepoints.length
+            v = decode_version(v)
+            ps = [`${v[0]}-${v[1] + (p.content_codepoints.length - 1)}`]
+            v = `${v[0]}-${v[1] + p.content_codepoints.length}`
+        }
+    }
+
+    for (let b of bytes) resource.doc.mergeBytes(b)
+    resource.val = resource.doc.get()
+
+    resource.need_defrag = true
+
+    if (options.merge_type != "dt") {
+        patches = get_xf_patches(resource.doc, v_before)
+        if (braid_text.verbose) console.log(JSON.stringify({ patches }))
+
+        let version = resource.doc.getRemoteVersion().map((x) => x.join("-")).sort()
+
+        for (let client of resource.simpleton_clients) {
+            if (client.peer == peer) {
+                client.my_last_seen_version = [og_v]
+            }
+
+            function set_timeout(time_override) {
+                if (client.my_timeout) clearTimeout(client.my_timeout)
+                client.my_timeout = setTimeout(() => {
+                    let version = resource.doc.getRemoteVersion().map((x) => x.join("-")).sort()
+                    let x = { version }
+                    x.parents = client.my_last_seen_version
+
+                    if (braid_text.verbose) console.log("rebasing after timeout.. ")
+                    if (braid_text.verbose) console.log("    client.my_unused_version_count = " + client.my_unused_version_count)
+                    x.patches = get_xf_patches(resource.doc, OpLog_remote_to_local(resource.doc, client.my_last_seen_version))
+
+                    if (braid_text.verbose) console.log(`sending from rebase: ${JSON.stringify(x)}`)
+                    client.subscribe(x)
+                    client.my_last_sent_version = x.version
+
+                    delete client.my_timeout
+                }, time_override ?? Math.min(3000, 23 * Math.pow(1.5, client.my_unused_version_count - 1)))
+            }
+
+            if (client.my_timeout) {
+                if (client.peer == peer) {
+                    if (!v_eq(client.my_last_sent_version, og_parents)) {
+                        // note: we don't add to client.my_unused_version_count,
+                        // because we're already in a timeout;
+                        // we'll just extend it here..
+                        set_timeout()
+                    } else {
+                        // hm.. it appears we got a correctly parented version,
+                        // which suggests that maybe we can stop the timeout early
+                        set_timeout(0)
+                    }
+                }
+                continue
+            }
+
+            let x = { version }
+            if (client.peer == peer) {
+                if (!v_eq(client.my_last_sent_version, og_parents)) {
+                    client.my_unused_version_count = (client.my_unused_version_count ?? 0) + 1
+                    set_timeout()
+                    continue
+                } else {
+                    delete client.my_unused_version_count
+                }
+
+                x.parents = options.version
+                if (!v_eq(version, options.version)) {
+                    if (braid_text.verbose) console.log("rebasing..")
+                    x.patches = get_xf_patches(resource.doc, OpLog_remote_to_local(resource.doc, [og_v]))
+                } else {
+                    // this client already has this version,
+                    // so let's pretend to send it back, but not
+                    if (braid_text.verbose) console.log(`not reflecting back to simpleton`)
+                    client.my_last_sent_version = x.version
+                    continue
+                }
+            } else {
+                x.parents = parents
+                x.patches = patches
+            }
+            if (braid_text.verbose) console.log(`sending: ${JSON.stringify(x)}`)
+            client.subscribe(x)
+            client.my_last_sent_version = x.version
+        }
+    } else {
+        if (resource.simpleton_clients.size) {
+            let version = resource.doc.getRemoteVersion().map((x) => x.join("-")).sort()
+            patches = get_xf_patches(resource.doc, v_before)
+            let x = { version, parents, patches }
+            if (braid_text.verbose) console.log(`sending: ${JSON.stringify(x)}`)
+            for (let client of resource.simpleton_clients) {
+                if (client.my_timeout) continue
+                client.subscribe(x)
+                client.my_last_sent_version = x.version
+            }
+        }
+    }
+
+    let x = {
+        version: [og_v],
+        parents: og_parents,
+        patches: og_patches,
+    }
     for (let client of resource.clients) {
-        if (client.peer != peer) client.subscribe(options)
+        if (client.peer != peer) client.subscribe(x)
     }
 
     await resource.db_delta(resource.doc.getPatchSince(v_before))
