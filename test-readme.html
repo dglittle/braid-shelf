@@ -1,0 +1,72 @@
+<body style="font-family: monospace; margin: 20px">
+    <h3>braid-shelf README test</h3>
+
+    <div>
+        <strong>Current data:</strong>
+        <pre id="output" style="background: #eee; padding: 10px; min-height: 40px"></pre>
+    </div>
+
+    <div>
+        <strong>Put some JSON:</strong><br>
+        <textarea id="input" rows="4" cols="50" style="font-family: monospace">{"hello": "world"}</textarea><br>
+        <button id="send">Send PUT</button>
+    </div>
+
+    <div id="log" style="margin-top: 20px; color: #666"></div>
+</body>
+
+<script src="https://unpkg.com/braid-http@~1.3/braid-http-client.js"></script>
+<script src="https://unpkg.com/shelf-merge"></script>
+<script>
+
+// --- This is the README client code ---
+
+let shelf = [null, 0]
+let peer = Math.random().toString(36).substr(2)
+
+function log(msg) {
+    let div = document.createElement('div')
+    div.textContent = new Date().toLocaleTimeString() + ' - ' + msg
+    document.getElementById('log').prepend(div)
+}
+
+// Subscribe to updates
+braid_fetch('/my-resource', {
+    subscribe: true,
+    retry: true,
+    peer,
+}).then((res) => {
+    log('Connected! Subscribed to /my-resource')
+    res.subscribe((update) => {
+        shelf_merge(shelf, [JSON.parse(update.body_text), JSON.parse(update.version[0])])
+        console.log('Current data:', shelf[0])
+        document.getElementById('output').textContent = JSON.stringify(shelf[0], null, 4)
+        log('Got update: ' + JSON.stringify(shelf[0]))
+    })
+}).catch(e => log('Error: ' + e))
+
+// Send an update
+function put(new_data) {
+    let change = shelf_merge(shelf, new_data)
+    if (change) braid_fetch('/my-resource', {
+        method: 'PUT',
+        peer,
+        version: [JSON.stringify(change[1])],
+        body: JSON.stringify(change[0])
+    })
+}
+
+// --- End README code ---
+
+document.getElementById('send').onclick = () => {
+    try {
+        let data = JSON.parse(document.getElementById('input').value)
+        put(data)
+        document.getElementById('output').textContent = JSON.stringify(shelf[0], null, 4)
+        log('Sent: ' + JSON.stringify(data))
+    } catch (e) {
+        log('Parse error: ' + e.message)
+    }
+}
+
+</script>

@@ -105,6 +105,7 @@ function put(new_data) {
     let change = shelf_merge(shelf, new_data)
     if (change) braid_fetch('/my-resource', {
         method: 'PUT',
+        peer,
         version: [JSON.stringify(change[1])],
         body: JSON.stringify(change[0])
     })

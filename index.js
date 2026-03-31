@@ -97,6 +97,7 @@ braid_shelf.serve = async (req, res, options = {}) => {
         console.log(`parents = ${req.parents}`)
 
         await braid_shelf.put(resource, {
+            peer,
             version: req.version,
             body: update.body_text
         })

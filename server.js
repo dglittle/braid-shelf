@@ -21,6 +21,11 @@ var server = require("http").createServer(async (req, res) => {
         return require("fs").createReadStream("./editor.html").pipe(res)
     }
 
+    if (req.url === '/test-readme') {
+        res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-cache" })
+        return require("fs").createReadStream("./test-readme.html").pipe(res)
+    }
+
     if (req.url.startsWith('/test.html')) {
         let parts = req.url.split(/[\?&=]/g)
 

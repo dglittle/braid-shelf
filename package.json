@@ -1,6 +1,6 @@
 {
   "name": "braid-shelf",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "main": "index.js",
   "description": "Library for collaborative json over http using braid.",
   "repository": "dglittle/braid-shelf",
