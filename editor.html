@@ -1,0 +1,51 @@
+<body style="background: auto; margin: 0px; padding: 0px">
+    <textarea id="texty" style="width: 100%; height: 100%; box-sizing: border-box"></textarea>
+</body>
+<script src="https://unpkg.com/braid-http@~1.3/braid-http-client.js"></script>
+<script src="https://unpkg.com/shelf-merge"></script>
+<script>
+
+let shelf = [null, 0]
+let peer = Math.random().toString(36).substr(2)
+
+function on_error(e) {
+    texty.disabled = true
+    texty.style.background = '#fee'
+    texty.style.border = '4px solid red'
+}
+
+texty.value = "";
+
+// getting
+braid_fetch(location.pathname, {
+    subscribe: true,
+    retry: true,
+    peer,
+}).then((res) => {
+    console.log('connected!')
+    res.subscribe((update) => {
+        console.log('got update: ', update)
+        shelf_merge(shelf, [JSON.parse(update.body_text), JSON.parse(update.version[0])])
+        texty.value = JSON.stringify(shelf[0], null, 4)
+    }, on_error)
+}).catch(on_error)
+
+// setting
+texty.oninput = (e) => {
+    try {
+        let parsed = JSON.parse(texty.value)
+
+        texty.style.background = ''
+        let change = shelf_merge(shelf, parsed)
+        if (change) braid_fetch(location.pathname, {
+            method: 'PUT',
+            version: [JSON.stringify(change[1])],
+            body: JSON.stringify(change[0])
+        })
+    } catch (e) {
+        console.log(e.stack)
+        texty.style.background = '#ff0' // '#ffe'
+    }
+}
+
+</script>

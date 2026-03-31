@@ -1,7 +1,5 @@
 
-let { Doc } = require("diamond-types-node")
-let braid_text = require('./index.js')
-let {dt_get, dt_get_patches, dt_parse, dt_create_bytes} = braid_text
+let braid_shelf = require('./index.js')
 
 process.on("unhandledRejection", (x) =>
     console.log(`unhandledRejection: ${x.stack}`)
@@ -10,7 +8,7 @@ process.on("uncaughtException", (x) =>
     console.log(`uncaughtException: ${x.stack}`)
 )
 
-braid_text.db_folder = null
+braid_shelf.db_folder = null
 
 async function main() {
     let best_seed = NaN
@@ -31,79 +29,8 @@ async function main() {
         console.log(`n = ${n}`)
 
         try {
-            // create a bunch of edits called doc,
-            // and remember a point along the way of adding all these edits,
-            // called middle_doc
-            let doc = new Doc('server')
-            let middle_doc = null
 
-            if (!middle_doc && (Math.random() < 1/n || n == 0))
-                middle_doc = Doc.fromBytes(doc.toBytes())
-            for (let i = 0; i < n; i++) {
-                console.log(`edit ${i}`)
 
-                make_random_edit(doc)
-                if (!middle_doc && (Math.random() < 1/n || i == n - 1))
-                    middle_doc = Doc.fromBytes(doc.toBytes())
-            }
-            if (!middle_doc) throw new Error('bad')
-
-            // put them into braid-text
-            let dt_to_braid = async (doc, key) => {
-                await braid_text.get(key, {})
-                for (let x of dt_get_patches(doc)) {
-                    console.log(`x = `, x)
-                    let y = {
-                        merge_type: 'dt',
-                        version: [x.version],
-                        parents: x.parents,
-                        patches: [{
-                            unit: x.unit,
-                            range: x.range,
-                            content: x.content
-                        }]
-                    }
-                    await braid_text.put(key, y)
-                    y.validate_already_seen_versions = true
-                    await braid_text.put(key, y)
-                }
-            }
-            await dt_to_braid(doc, 'doc')
-            await dt_to_braid(middle_doc, 'middle_doc')
-            console.log(`doc dt = ${doc.get()}`)
-            console.log(`middle_doc dt = ${middle_doc.get()}`)
-            console.log(`doc = ${await braid_text.get('doc')}`)
-            console.log(`middle_doc = ${await braid_text.get('middle_doc')}`)
-
-            // ensure they look right
-            if (doc.get() != await braid_text.get('doc')) throw new Error('bad')
-            if (middle_doc.get() != await braid_text.get('middle_doc')) throw new Error('bad')
-
-            // test getting old version
-            let middle_v = middle_doc.getRemoteVersion().map(x => x.join('-'))
-            console.log(`middle_doc = ${await braid_text.get('middle_doc')}`)
-            console.log(`middle_v = `, middle_v)
-            
-            let doc_v = doc.getRemoteVersion().map(x => x.join('-'))
-            console.log(`doc_v = `, doc_v)
-
-            console.log(`doc = `, await braid_text.get('doc', {version: middle_v}))
-            if (await braid_text.get('middle_doc') != (await braid_text.get('doc', {version: middle_v})).body) throw new Error('bad')
-
-            // try getting updates from middle_doc to doc
-            let o = {merge_type: 'dt', parents: middle_v, subscribe: update => {
-                braid_text.put('middle_doc', update)
-            }}
-            await braid_text.get('doc', o)
-            await braid_text.forget('doc', o)
-
-            if (await braid_text.get('middle_doc') != await braid_text.get('doc')) throw new Error('bad')
-
-            doc.free()
-            middle_doc.free()
-            for (let p of Object.values(braid_text.cache))
-                (await p).doc.free()
-            braid_text.cache = {}
         } catch (e) {
             if (console.log == og_log) throw e
             if (n < best_n) {
@@ -113,57 +40,6 @@ async function main() {
         }
     }
     og_log(`best_seed = ${best_seed}, best_n = ${best_n}`)
-}
-
-function make_random_edit(doc) {
-    let [agents, versions, _parentss] = dt_parse([...doc.toBytes()])
-
-    let agent = (agents.length && Math.random() > 0.5) ?
-        agents[Math.floor(Math.random() * agents.length)] :
-        Math.random().toString(36).slice(2)
-
-    let include_versions = []
-    let base_seq = -1
-    for (let i = 0; i < versions.length; i++) {
-        let [a, seq] = versions[i]
-        if (a == agent || Math.random() > 0.5) {
-            include_versions.push(a + '-' + seq)
-            if (a == agent && seq > base_seq) base_seq = seq
-        }
-    }
-    base_seq++
-
-    console.log({agents, versions, include_versions})
-
-    let parent_doc = dt_get(doc, include_versions)
-
-    let parents = parent_doc.getRemoteVersion().map(x => x.join('-'))
-
-    let len = parent_doc.len()
-    console.log(`len = ${len}`)
-
-    parent_doc.free()
-
-    if (len && Math.random() > 0.5) {
-        // delete
-        let start = Math.floor(Math.random() * len)
-        let del_len = Math.floor(Math.random() * (len - start - 1)) + 1
-
-        let args = [`${agent}-${base_seq}`, parents, start, del_len, null]
-        console.log(args)
-        doc.mergeBytes(dt_create_bytes(...args))
-    } else {
-        // insert
-        let start = Math.floor(Math.random() * (len + 1))
-        let ins = Array(Math.floor(Math.random() * 10) + 1).fill(0).map(() => getRandomCharacter()).join('')
-       
-        let args = [`${agent}-${base_seq}`, parents, start, 0, ins]
-        console.log(args)
-        doc.mergeBytes(dt_create_bytes(...args))
-    }
-
-    // work here
-    console.log(`doc => ${doc.get()}`)
 }
 
 //////////////////////////////////////////////////////////////////
@@ -192,12 +68,6 @@ function getRandomCharacter() {
 
     const randomIndex = Math.floor(Math.random() * characters.length);
     return characters[randomIndex];
-}
-
-function decode_version(v) {
-    let m = v.match(/^(.*)-(\d+)$/s)
-    if (!m) throw new Error(`invalid actor-seq version: ${v}`)
-    return [m[1], parseInt(m[2])]
 }
 
 /////////
